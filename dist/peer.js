@@ -2359,7 +2359,9 @@ Packer.prototype.pack_integer = function(num){
   } else if (0x0000000000000000 <= num && num <= 0xFFFFFFFFFFFFFFFF){
     this.bufferBuilder.append(0xcf);
     this.pack_uint64(num);
-  } else{
+  } else if(num===Number.NEGATIVE_INFINITY){
+    num=0;
+  } else {
     throw new Error('Invalid integer');
   }
 }
