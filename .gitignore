@@ -16,12 +16,8 @@ node_modules
 .cache
 .idea
 npm-debug.log
-<<<<<<< HEAD
-package-lock.json
-=======
 
 test/output
 .tscache
 test/public
 .vscode/
->>>>>>> ffadd2891df76fdd37671c352314de89c1e4833a
