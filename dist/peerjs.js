@@ -7333,32 +7333,25 @@ function (_super) {
     var _this = _super.call(this) || this;
 
     _this.pingInterval = pingInterval;
-    _this._disconnected = false;
+    _this._disconnected = true;
     _this._messagesQueue = [];
     var wsProtocol = secure ? "wss://" : "ws://";
-    _this._wsUrl = wsProtocol + host + ":" + port + path + "peerjs?key=" + key;
+    _this._baseUrl = wsProtocol + host + ":" + port + path + "peerjs?key=" + key;
     return _this;
   }
-  /** Check in with ID or get one from server. */
-
 
   Socket.prototype.start = function (id, token) {
-    this._id = id;
-    this._wsUrl += "&id=" + id + "&token=" + token;
-
-    this._startWebSocket();
-  };
-  /** Start up websocket communications. */
-
-
-  Socket.prototype._startWebSocket = function () {
     var _this = this;
 
-    if (this._socket) {
+    this._id = id;
+    var wsUrl = this._baseUrl + "&id=" + id + "&token=" + token;
+
+    if (!!this._socket || !this._disconnected) {
       return;
     }
 
-    this._socket = new WebSocket(this._wsUrl);
+    this._socket = new WebSocket(wsUrl);
+    this._disconnected = false;
 
     this._socket.onmessage = function (event) {
       var data;
@@ -7375,9 +7368,15 @@ function (_super) {
     };
 
     this._socket.onclose = function (event) {
+      if (_this._disconnected) {
+        return;
+      }
+
       logger_1.default.log("Socket closed.", event);
+
+      _this._cleanup();
+
       _this._disconnected = true;
-      clearTimeout(_this._wsPingTimer);
 
       _this.emit(enums_1.SocketEventType.Disconnected);
     }; // Take care of the queue of connections if necessary and make sure Peer knows
@@ -7385,7 +7384,9 @@ function (_super) {
 
 
     this._socket.onopen = function () {
-      if (_this._disconnected) return;
+      if (_this._disconnected) {
+        return;
+      }
 
       _this._sendQueuedMessages();
 
@@ -7483,12 +7484,25 @@ function (_super) {
   };
 
   Socket.prototype.close = function () {
-    if (!this._disconnected && !!this._socket) {
+    if (this._disconnected) {
+      return;
+    }
+
+    this._cleanup();
+
+    this._disconnected = true;
+  };
+
+  Socket.prototype._cleanup = function () {
+    if (!!this._socket) {
+      this._socket.onopen = this._socket.onmessage = this._socket.onclose = null;
+
       this._socket.close();
 
-      this._disconnected = true;
-      clearTimeout(this._wsPingTimer);
+      this._socket = undefined;
     }
+
+    clearTimeout(this._wsPingTimer);
   };
 
   return Socket;
@@ -8665,6 +8679,8 @@ function (_super) {
   function DataConnection(peerId, provider, options) {
     var _this = _super.call(this, peerId, provider, options) || this;
 
+    _this.jsonStringify = JSON.stringify;
+    _this.jsonParse = JSON.parse;
     _this._buffer = [];
     _this._bufferSize = 0;
     _this._buffering = false;
@@ -8674,10 +8690,6 @@ function (_super) {
     _this.label = _this.options.label || _this.connectionId;
     _this.serialization = _this.options.serialization || enums_1.SerializationType.Binary;
     _this.reliable = !!_this.options.reliable;
-
-    if (_this.options._payload) {
-      _this._peerBrowser = _this.options._payload.browser;
-    }
 
     _this._encodingQueue.on('done', function (ab) {
       _this._bufferedSend(ab);
@@ -8780,7 +8792,7 @@ function (_super) {
         deserializedData = util_1.util.unpack(ab);
       }
     } else if (this.serialization === enums_1.SerializationType.JSON) {
-      deserializedData = JSON.parse(data);
+      deserializedData = this.jsonParse(data);
     } // Check if we've chunked--if so, piece things back together.
     // We're guaranteed that this isn't 0.
 
@@ -8874,7 +8886,7 @@ function (_super) {
     }
 
     if (this.serialization === enums_1.SerializationType.JSON) {
-      this._bufferedSend(JSON.stringify(data));
+      this._bufferedSend(this.jsonStringify(data));
     } else if (this.serialization === enums_1.SerializationType.Binary || this.serialization === enums_1.SerializationType.BinaryUTF8) {
       var blob = util_1.util.pack(data);
 
@@ -8984,8 +8996,6 @@ function (_super) {
 
     switch (message.type) {
       case enums_1.ServerMessageType.Answer:
-        this._peerBrowser = payload.browser; // Forward to negotiator
-
         this._negotiator.handleSDP(message.type, payload.sdp);
 
         break;
@@ -9423,8 +9433,10 @@ function (_super) {
   __extends(Peer, _super);
 
   function Peer(id, options) {
-    var _this = _super.call(this) || this; // States.
+    var _this = _super.call(this) || this;
 
+    _this._id = null;
+    _this._lastServerId = null; // States.
 
     _this._destroyed = false; // Connections have been killed
 
@@ -9483,7 +9495,9 @@ function (_super) {
       logger_1.default.setLogFunction(_this._options.logFunction);
     }
 
-    logger_1.default.logLevel = _this._options.debug || 0; // Sanity checks
+    logger_1.default.logLevel = _this._options.debug || 0;
+    _this._api = new api_1.API(options);
+    _this._socket = _this._createServerConnection(); // Sanity checks
     // Ensure WebRTC supported
 
     if (!util_1.util.supports.audioVideo && !util_1.util.supports.data) {
@@ -9498,10 +9512,6 @@ function (_super) {
 
       return _this;
     }
-
-    _this._api = new api_1.API(options); // Start the server connection
-
-    _this._initializeServerConnection();
 
     if (userId) {
       _this._initialize(userId);
@@ -9592,40 +9602,42 @@ function (_super) {
     },
     enumerable: true,
     configurable: true
-  }); // Initialize the 'socket' (which is actually a mix of XHR streaming and
-  // websockets.)
+  });
 
-  Peer.prototype._initializeServerConnection = function () {
+  Peer.prototype._createServerConnection = function () {
     var _this = this;
 
-    this._socket = new socket_1.Socket(this._options.secure, this._options.host, this._options.port, this._options.path, this._options.key, this._options.pingInterval);
-    this.socket.on(enums_1.SocketEventType.Message, function (data) {
+    var socket = new socket_1.Socket(this._options.secure, this._options.host, this._options.port, this._options.path, this._options.key, this._options.pingInterval);
+    socket.on(enums_1.SocketEventType.Message, function (data) {
       _this._handleMessage(data);
     });
-    this.socket.on(enums_1.SocketEventType.Error, function (error) {
+    socket.on(enums_1.SocketEventType.Error, function (error) {
       _this._abort(enums_1.PeerErrorType.SocketError, error);
     });
-    this.socket.on(enums_1.SocketEventType.Disconnected, function () {
-      // If we haven't explicitly disconnected, emit error and disconnect.
-      if (!_this.disconnected) {
-        _this.emitError(enums_1.PeerErrorType.Network, "Lost connection to server.");
+    socket.on(enums_1.SocketEventType.Disconnected, function () {
+      if (_this.disconnected) {
+        return;
+      }
 
-        _this.disconnect();
-      }
+      _this.emitError(enums_1.PeerErrorType.Network, "Lost connection to server.");
+
+      _this.disconnect();
     });
-    this.socket.on(enums_1.SocketEventType.Close, function () {
-      // If we haven't explicitly disconnected, emit error.
-      if (!_this.disconnected) {
-        _this._abort(enums_1.PeerErrorType.SocketClosed, "Underlying socket is already closed.");
+    socket.on(enums_1.SocketEventType.Close, function () {
+      if (_this.disconnected) {
+        return;
       }
+
+      _this._abort(enums_1.PeerErrorType.SocketClosed, "Underlying socket is already closed.");
     });
+    return socket;
   };
   /** Initialize a connection with the server. */
 
 
   Peer.prototype._initialize = function (id) {
     this._id = id;
-    this.socket.start(this.id, this._options.token);
+    this.socket.start(id, this._options.token);
   };
   /** Handles messages from the server. */
 
@@ -9640,8 +9652,9 @@ function (_super) {
     switch (type) {
       case enums_1.ServerMessageType.Open:
         // The connection to the server is open.
-        this.emit(enums_1.PeerEventType.Open, this.id);
+        this._lastServerId = this.id;
         this._open = true;
+        this.emit(enums_1.PeerEventType.Open, this.id);
         break;
 
       case enums_1.ServerMessageType.Error:
@@ -9664,7 +9677,7 @@ function (_super) {
 
       case enums_1.ServerMessageType.Leave:
         // Another peer has closed its connection to this peer.
-        logger_1.default.log("Received leave message from", peerId);
+        logger_1.default.log("Received leave message from " + peerId);
 
         this._cleanupPeer(peerId);
 
@@ -9685,7 +9698,7 @@ function (_super) {
 
           if (connection) {
             connection.close();
-            logger_1.default.warn("Offer received for existing Connection ID:", connectionId);
+            logger_1.default.warn("Offer received for existing Connection ID:" + connectionId);
           } // Create a new connection.
 
 
@@ -9713,7 +9726,7 @@ function (_super) {
 
             this.emit(enums_1.PeerEventType.Connection, connection);
           } else {
-            logger_1.default.warn("Received malformed connection type:", payload.type);
+            logger_1.default.warn("Received malformed connection type:" + payload.type);
             return;
           } // Find messages.
 
@@ -9845,7 +9858,7 @@ function (_super) {
 
 
   Peer.prototype._addConnection = function (peerId, connection) {
-    logger_1.default.log("add connection " + connection.type + ":" + connection.connectionId + "\n       to peerId:" + peerId);
+    logger_1.default.log("add connection " + connection.type + ":" + connection.connectionId + " to peerId:" + peerId);
 
     if (!this._connections.has(peerId)) {
       this._connections.set(peerId, []);
@@ -9933,13 +9946,16 @@ function (_super) {
 
   Peer.prototype.emitError = function (type, err) {
     logger_1.default.error("Error:", err);
+    var error;
 
     if (typeof err === "string") {
-      err = new Error(err);
+      error = new Error(err);
+    } else {
+      error = err;
     }
 
-    err.type = type;
-    this.emit(enums_1.PeerEventType.Error, err);
+    error.type = type;
+    this.emit(enums_1.PeerEventType.Error, error);
   };
   /**
    * Destroys the Peer: closes all active connections as well as the connection
@@ -9950,12 +9966,17 @@ function (_super) {
 
 
   Peer.prototype.destroy = function () {
-    if (!this.destroyed) {
-      this._cleanup();
-
-      this.disconnect();
-      this._destroyed = true;
+    if (this.destroyed) {
+      return;
     }
+
+    logger_1.default.log("Destroy peer with ID:" + this.id);
+    this.disconnect();
+
+    this._cleanup();
+
+    this._destroyed = true;
+    this.emit(enums_1.PeerEventType.Close);
   };
   /** Disconnects every connection on this peer. */
 
@@ -9983,7 +10004,7 @@ function (_super) {
       }
     }
 
-    this.emit(enums_1.PeerEventType.Close);
+    this.socket.removeAllListeners();
   };
   /** Closes all connections to this peer. */
 
@@ -10021,23 +10042,18 @@ function (_super) {
 
 
   Peer.prototype.disconnect = function () {
-    var _this = this;
+    if (this.disconnected) {
+      return;
+    }
 
-    setTimeout(function () {
-      if (!_this.disconnected) {
-        _this._disconnected = true;
-        _this._open = false;
-
-        if (_this.socket) {
-          _this.socket.close();
-        }
-
-        _this.emit(enums_1.PeerEventType.Disconnected, _this.id);
-
-        _this._lastServerId = _this.id;
-        _this._id = null;
-      }
-    }, 0);
+    var currentId = this.id;
+    logger_1.default.log("Disconnect peer with ID:" + currentId);
+    this._disconnected = true;
+    this._open = false;
+    this.socket.close();
+    this._lastServerId = currentId;
+    this._id = null;
+    this.emit(enums_1.PeerEventType.Disconnected, currentId);
   };
   /** Attempts to reconnect with the same ID. */
 
@@ -10046,8 +10062,6 @@ function (_super) {
     if (this.disconnected && !this.destroyed) {
       logger_1.default.log("Attempting reconnection to server with ID " + this._lastServerId);
       this._disconnected = false;
-
-      this._initializeServerConnection();
 
       this._initialize(this._lastServerId);
     } else if (this.destroyed) {
